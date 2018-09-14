@@ -78,8 +78,7 @@ class BasketAddItemsViewTests(
         self.client.login(username=self.user.username, password=self.password)
 
         self.course = CourseFactory(partner=self.partner)
-        self.course.create_or_update_seat('verified', True, 50)
-        product = self.course.create_or_update_seat('verified', False, 0)
+        product = self.course.create_or_update_seat('verified', False, 50)
         self.stock_record = StockRecordFactory(product=product, partner=self.partner)
         self.catalog = Catalog.objects.create(partner=self.partner)
         self.catalog.stock_records.add(self.stock_record)
@@ -139,12 +138,9 @@ class BasketAddItemsViewTests(
     def test_add_multiple_products_and_use_voucher(self, usage):
         """ Verify the basket accepts multiple products and a single use voucher. """
         products = ProductFactory.create_batch(3, stockrecords__partner=self.partner)
-        voucher = factories.VoucherFactory(usage=usage)
         product_range = factories.RangeFactory(products=products)
-        voucher.offers.add(factories.ConditionalOfferFactory(
-            benefit=factories.BenefitFactory(range=product_range),
-            condition=factories.ConditionFactory(range=product_range)
-        ))
+        voucher, __ = prepare_voucher(_range=product_range, usage=usage)
+
         qs = urllib.urlencode({
             'sku': [product.stockrecords.first().partner_sku for product in products],
             'code': voucher.code
