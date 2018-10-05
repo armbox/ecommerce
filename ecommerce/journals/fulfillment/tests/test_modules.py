@@ -75,7 +75,7 @@ class JournalFulfillmentModuleTest(TestCase, JournalMixin):
         )
 
     @mock.patch("ecommerce.journals.fulfillment.modules.post_journal_access", mock.Mock(side_effect=HttpClientError))
-    def test_fulfill_with_error(self):
+    def test_fulfill_with_client_error(self):
         """ Test fulfilling a Journal product with raising the ConnectionError exception """
         __, completed_lines = JournalFulfillmentModule().fulfill_product(self.order, self.lines)
         self.assertEqual(
