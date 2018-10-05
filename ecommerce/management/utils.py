@@ -13,9 +13,13 @@ logger = logging.getLogger(__name__)
 
 Applicator = get_class('offer.applicator', 'Applicator')
 Basket = get_model('basket', 'Basket')
+EventHandler = get_class('order.processing', 'EventHandler')
 NoShippingRequired = get_class('shipping.methods', 'NoShippingRequired')
 Order = get_model('order', 'Order')
 OrderTotalCalculator = get_class('checkout.calculators', 'OrderTotalCalculator')
+ShippingEventType = get_model('order', 'ShippingEventType')
+
+SHIPPING_EVENT_NAME = 'Shipped'
 
 _payment_processors = {}
 
@@ -72,14 +76,20 @@ class FulfillFrozenBaskets(EdxOrderPlacementMixin):
 
     def fulfill_basket(self, basket_id, site):
 
-        logger.info('Trying to create order for frozen basket %d', basket_id)
+        logger.info('Trying to complete order for frozen basket %d', basket_id)
 
+        # Validate the basket.
         try:
             basket = Basket.objects.get(id=basket_id)
         except Basket.DoesNotExist:
             logger.info('Basket %d does not exist', basket_id)
             return False
 
+        # Make sure basket is Frozen which means payment was done.
+        if basket.status != basket.FROZEN:
+            return False
+
+        # We need to check if an order for basket exists.
         try:
             order = Order.objects.get(number=basket.order_number)
             if order:
@@ -87,64 +97,82 @@ class FulfillFrozenBaskets(EdxOrderPlacementMixin):
         except Order.DoesNotExist:
             pass
 
-        if basket.status != basket.FROZEN:
-            return False
+        # if no order exists we need to create a new order.
+        if not order:
+            basket.strategy = strategy.Default()
 
-        basket.strategy = strategy.Default()
-        Applicator().apply(basket, user=basket.owner)
+            # Need to handle the case that applied voucher has been expired.
+            # This will create the order  with out discount but subsequently
+            # run the fulfillment to update course mode.
+            try:
+                Applicator().apply(basket, user=basket.owner)
+            except ValueError:
+                basket.clear_vouchers()
 
-        successful_transaction = basket.paymentprocessorresponse_set.filer(
-            Q(response__contains="u'decision': u'ACCEPT'")
-            |
-            Q(response__contains="u'state': u'approved'")
-        )
-        if not successful_transaction:
-            logger.info('Basket %d do not have any successful payment response', basket_id)
-            return False
-
-        successful_payment_notification = successful_transaction[0]
-        if successful_payment_notification.transaction_id.startswith('PAY'):
-            card_number = 'PayPal Account'
-            card_type = None
-            self.payment_processor = _get_payment_processor(site, 'paypal')
-        else:
-            card_number = successful_payment_notification.response['req_card_number']
-            card_type = CYBERSOURCE_CARD_TYPE_MAP.get(successful_payment_notification.response['req_card_type'])
-            self.payment_processor = _get_payment_processor(site, 'cybersource')
-
-        handled_response = HandledProcessorResponse(
-            transaction_id=successful_payment_notification.transaction_id,
-            total=basket.total_excl_tax,
-            currency=basket.currency,
-            card_number=card_number,
-            card_type=card_type
-        )
-
-        try:
-            self.record_payment(basket=basket, handled_processor_response=handled_response)
-
-            shipping_method = NoShippingRequired()
-            shipping_charge = shipping_method.calculate(basket)
-            order_total = OrderTotalCalculator().calculate(basket, shipping_charge)
-
-            user = basket.owner
-            # Given a basket, order number generation is idempotent. Although we've already
-            # generated this order number once before, it's faster to generate it again
-            # than to retrieve an invoice number from PayPal.
-            order_number = basket.order_number
-
-            self.handle_order_placement(
-                order_number=order_number,
-                user=user,
-                basket=basket,
-                shipping_address=None,
-                shipping_method=shipping_method,
-                shipping_charge=shipping_charge,
-                billing_address=None,
-                order_total=order_total,
+            # Filter the successful payment processor response which in case
+            # of Cybersource includes "u'decision': u'ACCEPT'" and in case of
+            # Paypal includes "u'state': u'approved'".
+            successful_transaction = basket.paymentprocessorresponse_set.filer(
+                Q(response__contains="u'decision': u'ACCEPT'")
+                |
+                Q(response__contains="u'state': u'approved'")
             )
 
+            # In case of no successful transactions log and stop the process.
+            if not successful_transaction:
+                logger.info('Basket %d do not have any successful payment response', basket_id)
+                return False
+
+            successful_payment_notification = successful_transaction[0]
+            self.payment_processor = _get_payment_processor(successful_payment_notification.processor_name)
+
+            # Create handled response
+            handled_response = HandledProcessorResponse(
+                transaction_id=successful_payment_notification.transaction_id,
+                total=basket.total_excl_tax,
+                currency=basket.currency,
+                card_number=successful_payment_notification.response.get('req_card_number', None),
+                card_type=successful_payment_notification.response.get('req_card_type', 'Paypal Account'),
+            )
+
+            # Record Payment and try to place order
+            try:
+                self.record_payment(basket=basket, handled_processor_response=handled_response)
+
+                shipping_method = NoShippingRequired()
+                shipping_charge = shipping_method.calculate(basket)
+                order_total = OrderTotalCalculator().calculate(basket, shipping_charge)
+
+                user = basket.owner
+                # Given a basket, order number generation is idempotent. Although we've already
+                # generated this order number once before, it's faster to generate it again
+                # than to retrieve an invoice number from PayPal.
+                order_number = basket.order_number
+
+                self.handle_order_placement(
+                    order_number=order_number,
+                    user=user,
+                    basket=basket,
+                    shipping_address=None,
+                    shipping_method=shipping_method,
+                    shipping_charge=shipping_charge,
+                    billing_address=None,
+                    order_total=order_total,
+                )
+                logger.info('Successfully create order for basket %d'. basket.id)
+                return True
+            except:  # pylint: disable=bare-except
+                logger.exception('Unable to create order for basket %d', basket.id)
+                return False
+
+        # Start order fulfillment if order exists but is not fulfilled.
+        elif order.is_fulfillable:
+            order_lines = order.lines.all()
+            line_quantities = [line.quantity for line in order_lines]
+
+            shipping_event, __ = ShippingEventType.objects.get_or_create(name=SHIPPING_EVENT_NAME)
+            EventHandler().handle_shipping_event(order, shipping_event, order_lines, line_quantities)
+
+            if order.is_fulfillable:
+                return False
             return True
-        except:  # pylint: disable=bare-except
-            logger.exception('Unable to fulfill basket %d', basket.id)
-            return False
