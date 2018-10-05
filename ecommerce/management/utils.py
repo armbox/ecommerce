@@ -1,5 +1,6 @@
 import logging
 
+from django.db.models import Q
 from oscar.apps.partner import strategy
 from oscar.core.loading import get_class, get_model
 
@@ -13,6 +14,7 @@ logger = logging.getLogger(__name__)
 Applicator = get_class('offer.applicator', 'Applicator')
 Basket = get_model('basket', 'Basket')
 NoShippingRequired = get_class('shipping.methods', 'NoShippingRequired')
+Order = get_model('order', 'Order')
 OrderTotalCalculator = get_class('checkout.calculators', 'OrderTotalCalculator')
 
 _payment_processors = {}
@@ -78,28 +80,40 @@ class FulfillFrozenBaskets(EdxOrderPlacementMixin):
             logger.info('Basket %d does not exist', basket_id)
             return False
 
+        try:
+            order = Order.objects.get(number=basket.order_number)
+            if order:
+                logger.info('Basket %d does have a existing order %s', basket.id, basket.order_number)
+        except Order.DoesNotExist:
+            pass
+
+        if basket.status != basket.FROZEN:
+            return False
+
         basket.strategy = strategy.Default()
         Applicator().apply(basket, user=basket.owner)
 
-        transaction_responses = basket.paymentprocessorresponse_set.filter(transaction_id__isnull=False)
-        unique_transaction_ids = set([response.transaction_id for response in transaction_responses])
-
-        if len(unique_transaction_ids) > 1:
-            logger.info('Basket %d has more than one transaction id, not Fulfilling', basket_id)
+        successful_transaction = basket.paymentprocessorresponse_set.filer(
+            Q(response__contains="u'decision': u'ACCEPT'")
+            |
+            Q(response__contains="u'state': u'approved'")
+        )
+        if not successful_transaction:
+            logger.info('Basket %d do not have any successful payment response', basket_id)
             return False
 
-        response = transaction_responses[0]
-        if response.transaction_id.startswith('PAY'):
+        successful_payment_notification = successful_transaction[0]
+        if successful_payment_notification.transaction_id.startswith('PAY'):
             card_number = 'PayPal Account'
             card_type = None
             self.payment_processor = _get_payment_processor(site, 'paypal')
         else:
-            card_number = response.response['req_card_number']
-            card_type = CYBERSOURCE_CARD_TYPE_MAP.get(response.response['req_card_type'])
+            card_number = successful_payment_notification.response['req_card_number']
+            card_type = CYBERSOURCE_CARD_TYPE_MAP.get(successful_payment_notification.response['req_card_type'])
             self.payment_processor = _get_payment_processor(site, 'cybersource')
 
         handled_response = HandledProcessorResponse(
-            transaction_id=response.transaction_id,
+            transaction_id=successful_payment_notification.transaction_id,
             total=basket.total_excl_tax,
             currency=basket.currency,
             card_number=card_number,
